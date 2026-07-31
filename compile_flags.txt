@@ -1,0 +1,11 @@
+-I
+D:/qt/qt5.15/5.12.9/mingw73_64/include
+-I
+D:/qt/qt5.15/5.12.9/mingw73_64/include/QtCore
+-I
+D:/qt/qt5.15/5.12.9/mingw73_64/include/QtGui
+-I
+D:/qt/qt5.15/5.12.9/mingw73_64/include/QtQuick
+-I
+D:/qt/qt5.15/5.12.9/mingw73_64/include/QtQml
+-std=c++14

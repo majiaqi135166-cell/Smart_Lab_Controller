@@ -1,0 +1,7 @@
+<RCC>
+    <qresource prefix="/">
+        <file>main.qml</file>
+        <file>SensorCard.qml</file>
+        <file>fan.png</file>
+    </qresource>
+</RCC>
