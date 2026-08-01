@@ -1,5 +1,7 @@
 #include "tcpdevicechannel.h"
 
+#include <QDebug>
+#include <QThread>
 #include "ConfigManager.h"
 
 TcpDeviceChannel::TcpDeviceChannel(QObject *parent)

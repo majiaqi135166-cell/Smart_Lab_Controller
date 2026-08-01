@@ -14,9 +14,11 @@ class TcpDeviceChannel : public ITransportChannel
 public:
     explicit TcpDeviceChannel(QObject *parent = nullptr);
 
+public slots:
     void start() override;
     void stop() override;
 
+public:
     /// Send payload. Returns true if sent immediately, false if queued/offline.
     bool send(const QByteArray &payload) override;
 

@@ -9,18 +9,16 @@ LabApplicationService::LabApplicationService(QObject *parent)
     : QObject(parent)
     , m_deviceLogTimer(new QTimer(this))
     , m_logThread(new QThread(this))
-    , m_worker(new LogWorker(this))
+    , m_worker(new LogWorker())          // 不能传 this：后面 moveToThread 要求无 parent
     , m_dbThread(new QThread(this))
-    , m_dbWorker(new DatabaseWorker(this))
-    , m_IOThread(new QThread(this))
-    , m_transport(new TcpDeviceChannel(nullptr))   // 后面 moveToThread，不能传 this 做 parent
+    , m_dbWorker(new DatabaseWorker())  // 同上
+    , m_transport(new TcpDeviceChannel(this))
     , m_controller(new LabController([this](const QByteArray &payload) {
         m_transport->send(payload);
     }, this))
 {
     setupLogThread();
     setupDbThread();
-    setupIOThread();
 
     // Transport ↔ controller wiring (all main-thread objects → direct connections are fine)
     connect(m_transport, &TcpDeviceChannel::frameReceived,
@@ -44,26 +42,18 @@ LabApplicationService::LabApplicationService(QObject *parent)
             this, &LabApplicationService::handleDeviceLog);
 
     updateSensorData(SensorData(20.0, 20));
-
-    // transport 已移入 m_IOThread，必须通过队列调用让 socket 操作在正确线程执行
-    QMetaObject::invokeMethod(m_transport, "start", Qt::QueuedConnection);
+    m_transport->start();
 }
 
 LabApplicationService::~LabApplicationService()
 {
-    // 1. 停止 transport（它在 I/O 线程里，用阻塞调用确保在线程内执行）
-    QMetaObject::invokeMethod(m_transport, "stop", Qt::BlockingQueuedConnection);
+    m_transport->stop();
 
-    // 2. 断开跨线程连接，防止 worker 收到已析构对象的信号
     disconnect(m_transport, nullptr, this, nullptr);
     disconnect(m_controller, nullptr, m_worker, nullptr);
     disconnect(m_controller, nullptr, m_dbWorker, nullptr);
 
-    // 3. 关闭所有工作线程
     teardownThreads();
-
-    // 4. transport 没有 parent（因为移到了 I/O 线程），手动释放
-    delete m_transport;
 }
 
 const DeviceSnapshot &LabApplicationService::snapshot() const
@@ -192,18 +182,8 @@ void LabApplicationService::setupDbThread()
     m_dbThread->start();
 }
 
-void LabApplicationService::setupIOThread()
-{
-    m_transport->moveToThread(m_IOThread);
-    m_IOThread->start();
-}
 void LabApplicationService::teardownThreads()
 {
-    // I/O 线程必须先停：它的 QTcpSocket 事件循环停止后，transport 才安全释放
-    if (m_IOThread->isRunning()) {
-        m_IOThread->quit();
-        m_IOThread->wait(3000);
-    }
     if (m_logThread->isRunning()) {
         m_logThread->quit();
         m_logThread->wait(3000);

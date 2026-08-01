@@ -65,7 +65,6 @@ private:
     void setupLogThread();
     void setupDbThread();
     void teardownThreads();
-    void setupIOThread();
 
 private:
     QTimer *m_deviceLogTimer;
@@ -77,7 +76,6 @@ private:
     DeviceSnapshot m_snapshot;
     TcpDeviceChannel *m_transport;
     LabController *m_controller;
-    QThread *m_IOThread;
 };
 
 #endif

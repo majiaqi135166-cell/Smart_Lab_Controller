@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QFile>
 #include <QTextStream>
+#include<QThread>
 
 DatabaseWorker::DatabaseWorker(QObject *parent) : QObject(parent)
 {
@@ -57,8 +58,8 @@ void DatabaseWorker::logToDatabase(const QString &level, const QString &target, 
     if (!query.exec()) {
         emit errorOccurred("插入失败: " + query.lastError().text());
     } else {
-        qDebug() << "子线程记录成功 [" << level << "]:" << target << action;
-        
+        qDebug() << "[DB Worker] INSERT OK [" << level << "]:" << target << action;
+
         // 发送信号告知主线程有新条目（用于 UI 实时更新）
         QVariantMap entry;
         entry.insert("level", level);
