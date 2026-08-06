@@ -19,6 +19,12 @@ backend::backend(QObject *parent)
     connect(m_service, &LabApplicationService::overplanpower,
             this, &backend::overplanpower);
 
+    // Modbus 信号转发
+    connect(m_service, &LabApplicationService::modbusDataChanged,
+            this, &backend::onModbusDataChanged);
+    connect(m_service, &LabApplicationService::modbusConnectedChanged,
+            this, &backend::onModbusConnectedChanged);
+
     onSnapshotChanged(m_service->snapshot());
 }
 
@@ -126,4 +132,45 @@ void backend::onHistoryFetched(const QVariantList &history)
     m_pendingHistoryRequest = false;
     m_latestHistory = history;
     emit historyFetched(history);
+}
+
+// ── Modbus（QML ↔ 底层桥接）─────────────────────────────────────────────────
+
+void backend::connectModbus(const QString &portName, int baudRate)
+{
+    m_service->connectModbus(portName, baudRate);
+}
+
+void backend::disconnectModbus()
+{
+    m_service->disconnectModbus();
+}
+
+void backend::writeModbusRegister(int slaveId, int addr, int value)
+{
+    m_service->writeModbusRegister(slaveId, addr, value);
+}
+
+bool backend::modbusConnected() const
+{
+    return m_service->modbusConnected();
+}
+
+QVariantMap backend::modbusRegisters() const
+{
+    return m_service->modbusRegisters();
+}
+
+void backend::onModbusDataChanged(int sensorId, double value)
+{
+    Q_UNUSED(sensorId)
+    Q_UNUSED(value)
+    emit modbusRegistersChanged();
+    // QML 绑定 modbusRegisters 的属性会自动触发重新读取
+}
+
+void backend::onModbusConnectedChanged(bool connected)
+{
+    Q_UNUSED(connected)
+    emit modbusConnectedChanged();
 }

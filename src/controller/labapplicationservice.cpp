@@ -5,6 +5,8 @@
 #include <QTextStream>
 #include <QtGlobal>
 
+#include "ConfigManager.h"
+
 LabApplicationService::LabApplicationService(QObject *parent)
     : QObject(parent)
     , m_deviceLogTimer(new QTimer(this))
@@ -12,6 +14,7 @@ LabApplicationService::LabApplicationService(QObject *parent)
     , m_worker(new LogWorker())          // 不能传 this：后面 moveToThread 要求无 parent
     , m_dbThread(new QThread(this))
     , m_dbWorker(new DatabaseWorker())  // 同上
+    , m_modbusManager(new ModbusManager())  // 主线程：Modbus 是异步的，不阻塞 UI
     , m_transport(new TcpDeviceChannel(this))
     , m_controller(new LabController([this](const QByteArray &payload) {
         m_transport->send(payload);
@@ -19,6 +22,7 @@ LabApplicationService::LabApplicationService(QObject *parent)
 {
     setupLogThread();
     setupDbThread();
+    setupModbus();   // ★ 建立 Modbus → DB 的跨线程数据链路
 
     // Transport ↔ controller wiring (all main-thread objects → direct connections are fine)
     connect(m_transport, &TcpDeviceChannel::frameReceived,
@@ -49,9 +53,15 @@ LabApplicationService::~LabApplicationService()
 {
     m_transport->stop();
 
+    // 先断开 Modbus → DB 的跨线程连接，防止 Worker 已销毁后信号仍然投递
+    disconnect(m_modbusManager, nullptr, m_dbWorker, nullptr);
+
     disconnect(m_transport, nullptr, this, nullptr);
     disconnect(m_controller, nullptr, m_worker, nullptr);
     disconnect(m_controller, nullptr, m_dbWorker, nullptr);
+
+    // ModbusManager 无 parent，需手动释放（在 DB Worker 还活着时断开）
+    delete m_modbusManager;
 
     teardownThreads();
 }
@@ -180,6 +190,88 @@ void LabApplicationService::setupDbThread()
     connect(m_dbThread, &QThread::finished,
             m_dbWorker, &QObject::deleteLater);
     m_dbThread->start();
+}
+
+void LabApplicationService::setupModbus()
+{
+    // ── 连接 1：ModbusManager → DatabaseWorker（跨线程入库）──
+    connect(m_modbusManager, &ModbusManager::dataReceived,
+            m_dbWorker, &DatabaseWorker::logSensorData,
+            Qt::QueuedConnection);
+
+    // ── 连接 2：ModbusManager → LabApplicationService（UI 更新，同在主线程）──
+    connect(m_modbusManager, &ModbusManager::dataReceived,
+            this, &LabApplicationService::onModbusDataReceived);
+
+    // ── 连接 3：ModbusManager 连接/断开状态 → UI ──
+    connect(m_modbusManager, &ModbusManager::connected,
+            this, &LabApplicationService::onModbusConnected);
+    connect(m_modbusManager, &ModbusManager::disconnected,
+            this, &LabApplicationService::onModbusDisconnected);
+
+    // 从配置文件读取上次的串口号，自动连接
+    const QString port = ConfigManager::instance()->modbusPort();
+    if (!port.isEmpty()) {
+        qDebug() << "[LabAppService] 🔌 正在连接 Modbus 串口:" << port;
+        m_modbusManager->connectToSlave(port);
+    }
+
+    qDebug() << "[LabAppService] ✅ Modbus → DatabaseWorker 跨线程链路已建立";
+}
+
+// ── Modbus 控制（QML → backend → 这里）──────────────────────────────────────
+
+void LabApplicationService::connectModbus(const QString &portName, int baudRate)
+{
+    qDebug() << "[LabAppService] 🔌 QML 发起连接:" << portName << baudRate;
+    // 持久化配置，下次启动自动连接
+    ConfigManager::instance()->setModbusPort(portName);
+    m_modbusManager->connectToSlave(portName, baudRate);
+}
+
+void LabApplicationService::disconnectModbus()
+{
+    qDebug() << "[LabAppService] 🔌 QML 发起断开连接";
+    m_modbusManager->disconnectSlave();
+}
+
+void LabApplicationService::writeModbusRegister(int slaveId, int addr, int value)
+{
+    qDebug() << "[LabAppService] ✏️ QML 发起写入: 从站" << slaveId
+             << "寄存器" << addr << "=" << value;
+    m_modbusManager->writeSingleRegister(slaveId, addr,
+                                         static_cast<quint16>(value));
+    // 不需要等回复——1秒后的轮询会自动读取到新值并更新 UI
+}
+
+QVariantMap LabApplicationService::modbusRegisters() const
+{
+    QVariantMap map;
+    for (auto it = m_modbusRegisters.cbegin(); it != m_modbusRegisters.cend(); ++it) {
+        map.insert(QString::number(it.key()), it.value());
+    }
+    return map;
+}
+
+// ── Modbus 内部槽 ──────────────────────────────────────────────────────────
+
+void LabApplicationService::onModbusDataReceived(int sensorId, double value)
+{
+    m_modbusRegisters.insert(sensorId, value);
+    emit modbusDataChanged(sensorId, value);
+    // 这条信号 → backend → QML property binding → UI 自动刷新
+}
+
+void LabApplicationService::onModbusConnected()
+{
+    m_modbusConnected = true;
+    emit modbusConnectedChanged(true);
+}
+
+void LabApplicationService::onModbusDisconnected()
+{
+    m_modbusConnected = false;
+    emit modbusConnectedChanged(false);
 }
 
 void LabApplicationService::teardownThreads()

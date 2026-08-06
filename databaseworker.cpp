@@ -29,6 +29,8 @@ void DatabaseWorker::init()
     }
 
     QSqlQuery query(m_db);
+
+    // 设备操作日志表（已有）
     QString sql = "CREATE TABLE IF NOT EXISTS devise_Logs("
                   "id INTEGER PRIMARY KEY AUTOINCREMENT,"
                   "level TEXT,"
@@ -37,10 +39,22 @@ void DatabaseWorker::init()
                   "action TEXT,"
                   "val DOUBLE)";
     if (!query.exec(sql)) {
-        emit errorOccurred("建表失败: " + query.lastError().text());
-    } else {
-        qDebug() << "子线程数据库初始化成功";
+        emit errorOccurred("建表失败(devise_Logs): " + query.lastError().text());
+        return;
     }
+
+    // ★ 新增：传感器数据表（Modbus 轮询入库）
+    sql = "CREATE TABLE IF NOT EXISTS sensor_data("
+          "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+          "sensor_id INTEGER,"
+          "value DOUBLE,"
+          "timestamp DATETIME DEFAULT (datetime('now','localtime')))";
+    if (!query.exec(sql)) {
+        emit errorOccurred("建表失败(sensor_data): " + query.lastError().text());
+        return;
+    }
+
+    qDebug() << "[DB Worker] 子线程数据库初始化成功 (devise_Logs + sensor_data)";
 }
 
 void DatabaseWorker::logToDatabase(const QString &level, const QString &target, const QString &action, const QString &details)
@@ -90,6 +104,24 @@ void DatabaseWorker::getHistory()
     }
     
     emit historyReady(list);
+}
+
+void DatabaseWorker::logSensorData(int sensorId, double value)
+{
+    if (!m_db.isOpen()) return;
+
+    QSqlQuery query(m_db);
+    query.prepare("INSERT INTO sensor_data (sensor_id, value) "
+                  "VALUES (:sid, :val)");
+    query.bindValue(":sid", sensorId);
+    query.bindValue(":val", value);
+
+    if (!query.exec()) {
+        emit errorOccurred("传感器数据插入失败: " + query.lastError().text());
+    } else {
+        qDebug() << "[DB Worker] 🌡️ sensor" << sensorId
+                 << "=" << value << "→ 已入库";
+    }
 }
 
 bool DatabaseWorker::exportToCSV(const QString &fileName, const QVariantList &latestHistory)

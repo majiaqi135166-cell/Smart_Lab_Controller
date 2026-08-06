@@ -22,6 +22,9 @@ public slots:
     void getHistory(); // 异步获取历史记录
     bool exportToCSV(const QString &fileName, const QVariantList &latestHistory);
 
+    // ★ 新增：传感器数据入库（由 ModbusManager 跨线程触发）
+    void logSensorData(int sensorId, double value);
+
 signals:
     void historyReady(QVariantList history);
     void errorOccurred(const QString &error);

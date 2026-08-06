@@ -16,6 +16,10 @@ class backend : public QObject
     Q_PROPERTY(bool isFanActive READ isFanActive WRITE setIsFanActive NOTIFY fanActiveChanged)
     Q_PROPERTY(bool isOnline READ isOnline NOTIFY isOnlineChanged)
 
+    // Modbus 属性（供 QML 绑定）
+    Q_PROPERTY(bool modbusConnected READ modbusConnected NOTIFY modbusConnectedChanged)
+    Q_PROPERTY(QVariantMap modbusRegisters READ modbusRegisters NOTIFY modbusRegistersChanged)
+
 public:
     explicit backend(QObject *parent = nullptr);
     ~backend() override;
@@ -37,6 +41,15 @@ public:
     Q_INVOKABLE QVariantList getHistory();
     Q_INVOKABLE double getDeviceValue(const QString &deviceName);
 
+    // Modbus 操作（供 QML 调用）
+    Q_INVOKABLE void connectModbus(const QString &portName, int baudRate);
+    Q_INVOKABLE void disconnectModbus();
+    Q_INVOKABLE void writeModbusRegister(int slaveId, int addr, int value);
+
+    // Modbus 属性读取
+    bool modbusConnected() const;
+    QVariantMap modbusRegisters() const;
+
 signals:
     void laserPowerChanged();
     void lightBrightnessChanged();
@@ -48,9 +61,15 @@ signals:
     void historyFetched(QVariantList history);
     void overplanpower(QString msg);
 
+    // Modbus 信号（通知 QML）
+    void modbusConnectedChanged();
+    void modbusRegistersChanged();
+
 private slots:
     void onSnapshotChanged(const DeviceSnapshot &snapshot);
     void onHistoryFetched(const QVariantList &history);
+    void onModbusDataChanged(int sensorId, double value);
+    void onModbusConnectedChanged(bool connected);
 
 private:
     LabApplicationService *m_service;

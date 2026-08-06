@@ -8,7 +8,7 @@ Window {
     id: window
     visible: true
     width: 480
-    height: 750
+    height: 900
     title: qsTr("Smart_lab_Controller")
     property color defaultBgColor: "#f5f7fa"
 
@@ -48,6 +48,10 @@ Window {
         onLaserPowerChanged: addLog("激光功率已更新")
         onFanActiveChanged: addLog("风扇状态已更新")
         onIsOnlineChanged: addLog(cppbackend.isOnline ? "设备在线" : "设备离线")
+        onModbusConnectedChanged: addLog(cppbackend.modbusConnected ? "Modbus 已连接" : "Modbus 已断开")
+        onModbusRegistersChanged: {
+            // QML 绑定会自动更新，这里只做日志
+        }
     }
 
     Popup {
@@ -263,6 +267,129 @@ Window {
                     RowLayout { Layout.fillWidth: true; Text { text: "实时数值监控 (100ms 采样)"; font.bold: true; Layout.fillWidth: true } ComboBox { id: deviceSelector; model: ["laser", "brightness", "fan"]; currentIndex: 0; onCurrentIndexChanged: { lineSeries.clear(); chartTimer.dataCount = 0 } } }
                     ChartView { id: chartView; Layout.fillWidth: true; Layout.fillHeight: true; antialiasing: true; legend.visible: false; backgroundColor: "transparent"; ValueAxis { id: axisX; min: 0; max: 50; tickCount: 6; labelFormat: "%.0f"; titleText: "采样点" } ValueAxis { id: axisY; min: 0; max: 200; titleText: "数值" } LineSeries { id: lineSeries; name: deviceSelector.currentText; axisX: axisX; axisY: axisY; color: "#409EFF"; width: 2 } }
                     Timer { id: chartTimer; interval: 100; running: true; repeat: true; property int dataCount: 0; onTriggered: { let val = cppbackend.getDeviceValue(deviceSelector.currentText); lineSeries.append(dataCount, val); if (lineSeries.count > 100) lineSeries.remove(0); dataCount++; if (dataCount > axisX.max) { axisX.min = dataCount - 50; axisX.max = dataCount } if (deviceSelector.currentText === "fan") axisY.max = 1.5; else if (deviceSelector.currentText === "brightness") axisY.max = 110; else axisY.max = 210 } }
+                }
+            }
+
+            // ━━━━━━━━━━━━ Modbus 传感器面板 ━━━━━━━━━━━━
+            Rectangle {
+                Layout.fillWidth: true
+                height: 300
+                color: "white"
+                radius: 10
+                border.color: "#dcdfe6"
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 10
+                    spacing: 12
+
+                    // 标题行 + 连接指示灯
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: "Modbus 传感器监控"; font.bold: true; Layout.fillWidth: true }
+                        Rectangle {
+                            width: 10; height: 10; radius: 5
+                            color: cppbackend.modbusConnected ? "#2ecc71" : "#e74c3c"
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Text {
+                            text: cppbackend.modbusConnected ? "已连接" : "未连接"
+                            font.pixelSize: 12; color: "#909399"
+                        }
+                    }
+
+                    // 串口配置行
+                    RowLayout {
+                        spacing: 10
+                        TextField {
+                            id: modbusPortInput
+                            placeholderText: "串口号"; text: "COM13"
+                            Layout.preferredWidth: 80
+                        }
+                        TextField {
+                            id: modbusBaudInput
+                            placeholderText: "波特率"; text: "9600"
+                            Layout.preferredWidth: 70
+                        }
+                        Button {
+                            text: cppbackend.modbusConnected ? "断开" : "连接"
+                            Layout.preferredWidth: 60
+                            background: Rectangle {
+                                color: cppbackend.modbusConnected ? "#F56C6C" : "#67C23A"
+                                radius: 4
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: "white"
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                font.pixelSize: 13
+                            }
+                            onClicked: {
+                                if (cppbackend.modbusConnected) {
+                                    cppbackend.disconnectModbus()
+                                } else {
+                                    cppbackend.connectModbus(modbusPortInput.text, parseInt(modbusBaudInput.text))
+                                }
+                            }
+                        }
+                    }
+
+                    // 分隔线
+                    Rectangle { Layout.fillWidth: true; height: 1; color: "#ebeef5" }
+
+                    // 寄存器实时值
+                    RowLayout {
+                        spacing: 15
+                        Layout.fillWidth: true
+                        Rectangle {
+                            Layout.fillWidth: true; height: 70; radius: 8; color: "#f0f9eb"
+                            Column {
+                                anchors.centerIn: parent
+                                Text { text: "寄存器 0 (温度)"; color: "#909399"; font.pixelSize: 12; anchors.horizontalCenter: parent.horizontalCenter }
+                                Text {
+                                    text: (cppbackend.modbusRegisters["0"] !== undefined ? cppbackend.modbusRegisters["0"].toFixed(1) : "--") + " ℃"
+                                    color: "#67C23A"; font.bold: true; font.pixelSize: 22
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                            }
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true; height: 70; radius: 8; color: "#ecf5ff"
+                            Column {
+                                anchors.centerIn: parent
+                                Text { text: "寄存器 1 (湿度)"; color: "#909399"; font.pixelSize: 12; anchors.horizontalCenter: parent.horizontalCenter }
+                                Text {
+                                    text: (cppbackend.modbusRegisters["1"] !== undefined ? cppbackend.modbusRegisters["1"].toFixed(1) : "--") + " %"
+                                    color: "#409EFF"; font.bold: true; font.pixelSize: 22
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                            }
+                        }
+                    }
+
+                    // 写入寄存器
+                    RowLayout {
+                        spacing: 10
+                        Layout.fillWidth: true
+                        Text { text: "写入寄存器:"; font.pixelSize: 13; color: "#606266" }
+                        TextField {
+                            id: writeAddrInput; text: "0"; Layout.preferredWidth: 50
+                            placeholderText: "地址"
+                        }
+                        TextField {
+                            id: writeValueInput; text: "0"; Layout.preferredWidth: 60
+                            placeholderText: "数值"
+                        }
+                        Button {
+                            text: "写入"
+                            Layout.preferredWidth: 50
+                            onClicked: {
+                                cppbackend.writeModbusRegister(1, parseInt(writeAddrInput.text), parseInt(writeValueInput.text))
+                                addLog("Modbus 写入: 寄存器[" + writeAddrInput.text + "] ← " + writeValueInput.text)
+                            }
+                        }
+                    }
+                    Text { text: "提示：写入后无需等待回复，1秒轮询会自动同步新值到上方显示"; font.pixelSize: 10; color: "#c0c4cc" }
                 }
             }
 
