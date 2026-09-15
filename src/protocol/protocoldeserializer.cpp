@@ -26,17 +26,19 @@ QVector<ProtocolMessage> ProtocolDeserializer::takeMessages()
 
         // Reject oversized payloads to prevent memory exhaustion
         if (header.payloadLength > PacketHeader::MaxPayloadSize) {
-            const int skipSize = PacketHeader::EncodedSize + static_cast<int>(header.payloadLength);
-            if (m_buffer.canPeek(skipSize)) {
-                m_buffer.consume(skipSize);
-            } else {
-                m_buffer.consume(PacketHeader::EncodedSize);
-                m_buffer.consume(m_buffer.size()); // discard remaining — payload was truncated
-            }
-            emit errorOccurred(QStringLiteral("Oversized payload declared (%1 bytes) — packet discarded")
-                                   .arg(header.payloadLength));
-            continue;
-        }
+             // ★ 用 qint64 计算：quint32 转 int 会截断成负数，导致 skipSize ≤ 0 → 循环无法推进
+             const qint64 declaredTotal = static_cast<qint64>(PacketHeader::EncodedSize)
+                                        + static_cast<qint64>(header.payloadLength);
+             if (declaredTotal <= m_buffer.size()) {
+                 m_buffer.consume(static_cast<int>(declaredTotal));   // 整包已到齐：精确丢弃
+             } else {
+                 m_buffer.consume(PacketHeader::EncodedSize);
+                 m_buffer.consume(m_buffer.size());   // 声明长度 > 缓冲上限，这帧永远收不全
+             }
+             emit errorOccurred(QStringLiteral("Oversized payload declared (%1 bytes) — packet discarded")
+                                    .arg(header.payloadLength));
+             continue;   // 此时缓冲必为空或已对齐，循环必然收敛
+         }
 
         const int packetSize = PacketHeader::EncodedSize + static_cast<int>(header.payloadLength);
         if (!m_buffer.canPeek(packetSize)) {
@@ -78,6 +80,9 @@ bool ProtocolDeserializer::tryConsumeCorruptedPrefix()
         return false;
     }
 
+    if (!m_buffer.canPeek(PacketHeader::EncodedSize))
+             return false;
+
     const QByteArray available = m_buffer.peek(m_buffer.size());
 
     // Magic bytes in network byte order (0xAB 0xCD)
@@ -87,7 +92,7 @@ bool ProtocolDeserializer::tryConsumeCorruptedPrefix()
     };
 
     // Search for the magic marker in the buffer
-    for (int i = 1; i < available.size(); ++i) {
+    for (int i = 2; i < available.size(); ++i) {
         if (static_cast<quint8>(available.at(i - 1)) == static_cast<quint8>(magicBytes[0])
             && static_cast<quint8>(available.at(i)) == static_cast<quint8>(magicBytes[1])) {
             m_buffer.consume(i - 1);
@@ -97,7 +102,7 @@ bool ProtocolDeserializer::tryConsumeCorruptedPrefix()
 
     // No magic found — discard all but the last byte (which might be the first half of magic)
     m_buffer.consume(qMax(0, available.size() - 1));
-    return m_buffer.canPeek(2);
+    return false;
 }
 
 bool ProtocolDeserializer::validateCrc(const PacketHeader &header, const QByteArray &payload) const
