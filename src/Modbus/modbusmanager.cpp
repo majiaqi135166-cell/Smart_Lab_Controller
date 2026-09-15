@@ -1,46 +1,99 @@
 #include "modbusmanager.h"
+#include <QDateTime>
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 构造函数 & 析构
+// ═══════════════════════════════════════════════════════════════════════════
 
 ModbusManager::ModbusManager(QObject *parent)
     : QObject(parent)
 {
     m_modbusClient = new QModbusRtuSerialMaster(this);
-    m_autoReadTimer = new QTimer(this);
 
-    // ── 轮询定时器：每 1 秒从传感器读取一次数据 ──
-    m_autoReadTimer->setInterval(1000);
-    connect(m_autoReadTimer, &QTimer::timeout, this, [this]() {
-        if (m_isConnected
-            && m_modbusClient
-            && m_modbusClient->state() == QModbusDevice::ConnectedState) {
-            readHoldRegisters(m_slaveId, m_startAddr, m_registerCount);
-        }
-    });
+    // ── 统一轮询定时器：每 200ms 检查哪些从站该轮询了 ──
+    m_pollTimer = new QTimer(this);
+    m_pollTimer->setInterval(PollCheckIntervalMs);
+    connect(m_pollTimer, &QTimer::timeout,
+            this, &ModbusManager::onPollTimer);
+    // 注意：m_pollTimer 不在构造函数中 start()
+    // 它会在串口连接成功后（onStateChanged → ConnectedState）启动
 
-    // ── 设备状态变化 → 管理 m_isConnected 和定时器 ──
+    // ── 重连定时器（指数退避，单次触发）──
+    m_reconnectTimer = new QTimer(this);
+    m_reconnectTimer->setSingleShot(true);
+    connect(m_reconnectTimer, &QTimer::timeout,
+            this, &ModbusManager::onReconnectTimer);
+
+    // ── 回复超时定时器（防止坏从站卡死队列）──
+    m_replyTimeoutTimer = new QTimer(this);
+    m_replyTimeoutTimer->setSingleShot(true);
+    connect(m_replyTimeoutTimer, &QTimer::timeout,
+            this, &ModbusManager::onReplyTimeout);
+
+    // ── 设备状态变化 ──
     connect(m_modbusClient, &QModbusDevice::stateChanged,
             this, &ModbusManager::onStateChanged);
-
-    // 注意：定时器不在构造函数中启动！
-    // 启动时机：connectToSlave 成功后，在 onStateChanged 中收到 ConnectedState 时启动。
-    // 这样避免了"还没连接就开始轮询"的无效操作。
 }
 
 ModbusManager::~ModbusManager()
 {
-    m_autoReadTimer->stop();
+    m_pollTimer->stop();
+    m_reconnectTimer->stop();
+    m_replyTimeoutTimer->stop();
+
+    m_highQueue.clear();
+    m_normalQueue.clear();
+    m_pendingReply = nullptr;
+
     if (m_modbusClient) {
         m_modbusClient->disconnectDevice();
     }
 }
 
-void ModbusManager::setPollConfig(int slaveId, int startAddr, int count)
+// ═══════════════════════════════════════════════════════════════════════════
+// 从站管理
+// ═══════════════════════════════════════════════════════════════════════════
+
+void ModbusManager::addSlave(const ModbusSlaveConfig &config)
 {
-    m_slaveId = slaveId;
-    m_startAddr = startAddr;
-    m_registerCount = count;
+    // 检查是否已存在同一个 slaveId
+    for (int i = 0; i < m_slaves.size(); ++i) {
+        if (m_slaves[i].slaveId == config.slaveId) {
+            // 替换旧配置
+            m_slaves[i] = config;
+            qDebug() << "[Modbus] 更新从站配置: ID" << config.slaveId << config.name;
+            return;
+        }
+    }
+
+    m_slaves.append(config);
+    m_lastPollTime.insert(config.slaveId, 0);
+    qDebug() << "[Modbus] 添加从站: ID" << config.slaveId << config.name
+             << "轮询间隔:" << config.pollIntervalMs << "ms";
 }
 
-// ── 连接/断开 ───────────────────────────────────────────────────────────────
+void ModbusManager::removeSlave(int slaveId)
+{
+    for (int i = 0; i < m_slaves.size(); ++i) {
+        if (m_slaves[i].slaveId == slaveId) {
+            qDebug() << "[Modbus] 移除从站: ID" << slaveId << m_slaves[i].name;
+            m_slaves.removeAt(i);
+            m_lastPollTime.remove(slaveId);
+            return;
+        }
+    }
+}
+
+void ModbusManager::clearSlaves()
+{
+    m_slaves.clear();
+    m_lastPollTime.clear();
+    qDebug() << "[Modbus] 已清除所有从站";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 串口连接/断开
+// ═══════════════════════════════════════════════════════════════════════════
 
 bool ModbusManager::connectToSlave(const QString &portName, int baudRate)
 {
@@ -48,12 +101,14 @@ bool ModbusManager::connectToSlave(const QString &portName, int baudRate)
         return false;
     }
 
-    // 如果已经连接，先断开
+    m_lastPortName = portName;
+    m_lastBaudRate = baudRate;
+    m_autoReconnect = true;
+
     if (m_modbusClient->state() == QModbusDevice::ConnectedState) {
         m_modbusClient->disconnectDevice();
     }
 
-    // 配置串口参数
     m_modbusClient->setConnectionParameter(
         QModbusDevice::SerialPortNameParameter, QVariant(portName));
     m_modbusClient->setConnectionParameter(
@@ -79,14 +134,21 @@ bool ModbusManager::connectToSlave(const QString &portName, int baudRate)
 
     qDebug() << "🔌 成功发起串口连接，目标端口:" << portName
              << "波特率:" << baudRate;
-    // 注意：connectDevice() 返回 true 只表示"连接请求已发起"，不代表物理连接已建立。
-    // 真正的连接确认在 onStateChanged 回调中。
     return true;
 }
 
 void ModbusManager::disconnectSlave()
 {
-    m_autoReadTimer->stop();
+    m_autoReconnect = false;
+    m_reconnectTimer->stop();
+    m_replyTimeoutTimer->stop();
+
+    m_pollTimer->stop();
+    m_highQueue.clear();
+    m_normalQueue.clear();
+    m_queueState = QueueState::Idle;
+    m_pendingReply = nullptr;
+
     m_isConnected = false;
     if (m_modbusClient) {
         m_modbusClient->disconnectDevice();
@@ -94,101 +156,276 @@ void ModbusManager::disconnectSlave()
     emit disconnected();
 }
 
-// ── 读取/写入 ───────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// 对外接口（不再直接发请求，改为入队）
+// ═══════════════════════════════════════════════════════════════════════════
 
 void ModbusManager::readHoldRegisters(int slaveId, int startAddr, int count)
 {
-    if (!m_isConnected || !m_modbusClient
-        || m_modbusClient->state() != QModbusDevice::ConnectedState) {
-        return; // 静默返回，避免每秒刷屏
-    }
-
-    QModbusDataUnit readUnit(QModbusDataUnit::HoldingRegisters, startAddr, count);
-
-    if (auto *reply = m_modbusClient->sendReadRequest(readUnit, slaveId)) {
-        if (!reply->isFinished()) {
-            // 异步等待：回复到达后由 onReadReady 处理
-            connect(reply, &QModbusReply::finished,
-                    this, &ModbusManager::onReadReady);
-        } else {
-            // 同步完成（极少数情况，如缓存命中）
-            delete reply;
-        }
-    } else {
-        qDebug() << "❌ 发送 Modbus 读取请求失败:" << m_modbusClient->errorString();
-        emit errorOccurred(m_modbusClient->errorString());
-    }
+    if (!m_isConnected) return;
+    enqueue(ModbusTask::makeRead(slaveId, startAddr, count));
 }
 
 void ModbusManager::writeSingleRegister(int slaveId, int addr, quint16 value)
 {
+    if (!m_isConnected) return;
+    enqueue(ModbusTask::makeWrite(slaveId, addr, value));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 任务队列核心
+// ═══════════════════════════════════════════════════════════════════════════
+
+void ModbusManager::enqueue(const ModbusTask &task)
+{
+    // 按优先级分别放入两个队列
+    if (task.priority == ModbusTask::High) {
+        m_highQueue.enqueue(task);
+    } else {
+        m_normalQueue.enqueue(task);
+    }
+
+    qDebug() << QString("[Modbus 队列] 入队: %1 slave%2 addr=%3 cnt=%4 "
+                        "高优:%5 普通:%6")
+                    .arg(task.type == ModbusTask::Read ? "读" : "写")
+                    .arg(task.slaveId)
+                    .arg(task.startAddr)
+                    .arg(task.registerCount)
+                    .arg(m_highQueue.size())
+                    .arg(m_normalQueue.size());
+
+    // 如果当前空闲，立即处理
+    if (m_queueState == QueueState::Idle) {
+        processQueue();
+    }
+    // 如果正在等待回复 → 新任务排队等待，当前回复到达后 processQueue() 会处理
+}
+
+void ModbusManager::processQueue()
+{
+    // ── 条件检查 ──
+    if (m_queueState != QueueState::Idle) {
+        return;  // 还有请求在飞，不能发新的
+    }
+
     if (!m_modbusClient
         || m_modbusClient->state() != QModbusDevice::ConnectedState) {
-        qDebug() << "❌ 写入失败：设备未连接";
+        return;  // 没连接，不发
+    }
+
+    // ── 取任务：高优先级队列优先 ──
+    ModbusTask task;
+    if (!m_highQueue.isEmpty()) {
+        task = m_highQueue.dequeue();     // ★ 写入优先
+    } else if (!m_normalQueue.isEmpty()) {
+        task = m_normalQueue.dequeue();   // 轮询读取
+    } else {
+        return;  // 两个队列都空
+    }
+
+    // ── 构造 Modbus 数据单元 ──
+    QModbusDataUnit unit(
+        task.type == ModbusTask::Read
+            ? QModbusDataUnit::HoldingRegisters
+            : QModbusDataUnit::HoldingRegisters,  // 读写都是 HoldingRegisters
+        task.startAddr,
+        task.registerCount);
+
+    if (task.type == ModbusTask::Write) {
+        unit.setValue(0, task.writeValue);
+    }
+
+    // ── 发送请求 ──
+    QModbusReply *reply = nullptr;
+    if (task.type == ModbusTask::Read) {
+        reply = m_modbusClient->sendReadRequest(unit, task.slaveId);
+    } else {
+        reply = m_modbusClient->sendWriteRequest(unit, task.slaveId);
+    }
+
+    if (!reply) {
+        qDebug() << "[Modbus 队列] ❌ 发送请求失败:"
+                 << m_modbusClient->errorString();
+        // 发送失败 → 不阻塞，立即处理下一个
+        processQueue();
         return;
     }
 
-    QModbusDataUnit writeUnit(QModbusDataUnit::HoldingRegisters, addr, 1);
-    writeUnit.setValue(0, value);
+    // ── 发送成功 → 进入等待状态 ──
+    m_queueState = QueueState::WaitingReply;
+    m_pendingReply = reply;
+    m_pendingTaskType = task.type;   // ★ 记住：这个回复是读还是写
 
-    if (auto *reply = m_modbusClient->sendWriteRequest(writeUnit, slaveId)) {
-        if (!reply->isFinished()) {
-            connect(reply, &QModbusReply::finished, this, [reply]() {
-                if (reply->error() == QModbusDevice::NoError) {
-                    qDebug() << "✅ Modbus 写入成功";
-                } else {
-                    qDebug() << "❌ Modbus 写入失败:" << reply->errorString();
-                }
-                reply->deleteLater();
-            });
-        } else {
-            reply->deleteLater();
-        }
-    } else {
-        qDebug() << "❌ 发送写入请求失败:" << m_modbusClient->errorString();
-    }
+    // 注册回复回调
+    connect(reply, &QModbusReply::finished,
+            this, &ModbusManager::onReplyFinished);
+
+    // 启动超时定时器
+    m_replyTimeoutTimer->start(ReplyTimeoutMs);
+
+    qDebug() << QString("[Modbus 队列] ➤ 发送: %1 slave%2 addr=%3 cnt=%4")
+                    .arg(task.type == ModbusTask::Read ? "读" : "写")
+                    .arg(task.slaveId)
+                    .arg(task.startAddr)
+                    .arg(task.registerCount);
 }
 
-// ── Slots ────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// Slots
+// ═══════════════════════════════════════════════════════════════════════════
+
+void ModbusManager::onReplyFinished()
+{
+    m_replyTimeoutTimer->stop();  // 回复到了，取消超时
+
+    auto *reply = qobject_cast<QModbusReply *>(sender());
+    if (!reply) {
+        m_queueState = QueueState::Idle;
+        m_pendingReply = nullptr;
+        processQueue();
+        return;
+    }
+
+    const int slaveId = reply->serverAddress();
+
+    if (reply->error() == QModbusDevice::NoError) {
+        const QModbusDataUnit unit = reply->result();
+
+        // ★ 按任务类型分支处理：读写回复完全不同
+        if (m_pendingTaskType == ModbusTask::Read) {
+            // ── 读回复：解析寄存器值 → 广播数据 ──
+            for (uint i = 0; i < unit.valueCount(); ++i) {
+                const int sensorId = unit.startAddress() + static_cast<int>(i);
+                const double value = static_cast<double>(unit.value(i));
+
+                qDebug() << QString("📡 [从站%1] 寄存器[%2] → %3")
+                                .arg(slaveId)
+                                .arg(sensorId)
+                                .arg(value);
+
+                emit dataReceived(slaveId,sensorId, value);
+            }
+        } else {
+            // ── 写回复：只是请求回显，不是新数据 ──
+            // 不 emit dataReceived！下一次轮询读取会自动读到新值并广播
+            qDebug() << QString("✅ [从站%1] 写入寄存器[%2]成功")
+                            .arg(slaveId)
+                            .arg(unit.startAddress());
+        }
+
+        emit taskCompleted(slaveId, true, QString());
+
+    } else {
+        // ── 失败 ──
+        qDebug() << QString("⚠️ [从站%1] 请求失败: %2")
+                        .arg(slaveId)
+                        .arg(reply->errorString());
+
+        emit taskCompleted(slaveId, false, reply->errorString());
+    }
+
+    reply->deleteLater();
+
+    // ★ 解锁 → 立即处理队列中下一个任务
+    m_queueState = QueueState::Idle;
+    m_pendingReply = nullptr;
+    processQueue();
+}
+
+void ModbusManager::onReplyTimeout()
+{
+    qDebug() << "[Modbus 队列] ⏰ 回复超时！强制解锁，跳过当前请求";
+
+    // 强制解锁状态机，让队列继续
+    m_queueState = QueueState::Idle;
+    m_pendingReply = nullptr;
+
+    processQueue();
+}
 
 void ModbusManager::onStateChanged(QModbusDevice::State state)
 {
     if (state == QModbusDevice::ConnectedState) {
         m_isConnected = true;
+        m_reconnectDelayMs = MinReconnectDelayMs;
+        m_reconnectTimer->stop();
+
         qDebug() << "🟢 Modbus 设备已连接，启动轮询...";
-        m_autoReadTimer->start();
+
+        // 启动统一轮询定时器
+        m_pollTimer->start();
+
         emit connected();
+
     } else if (state == QModbusDevice::UnconnectedState) {
         m_isConnected = false;
-        qDebug() << "🔴 Modbus 设备已断开，暂停轮询";
-        m_autoReadTimer->stop();
-        emit disconnected();
+        m_pollTimer->stop();
+        m_replyTimeoutTimer->stop();
+
+        // 清空队列（断线了，积压的任务没意义）
+        m_highQueue.clear();
+        m_normalQueue.clear();
+        m_queueState = QueueState::Idle;
+        m_pendingReply = nullptr;
+
+        if (m_autoReconnect) {
+            qDebug() << "🔴 Modbus 意外断开，启动指数退避重连...";
+            emit reconnecting();
+            scheduleReconnect();
+        } else {
+            qDebug() << "🔴 Modbus 设备已断开（用户主动）";
+            emit disconnected();
+        }
     }
 }
 
-void ModbusManager::onReadReady()
+void ModbusManager::onPollTimer()
 {
-    auto *reply = qobject_cast<QModbusReply *>(sender());
-    if (!reply) {
+    // 每 200ms 检查一次：哪些从站的轮询间隔到了？
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+    for (const ModbusSlaveConfig &slave : m_slaves) {
+        const qint64 lastPoll = m_lastPollTime.value(slave.slaveId, 0);
+        const qint64 elapsed = now - lastPoll;
+
+        if (elapsed >= slave.pollIntervalMs) {
+            // 该从站的轮询间隔到了 → 入队一个 Read 任务
+            m_lastPollTime.insert(slave.slaveId, now);
+            readHoldRegisters(slave.slaveId, slave.startAddr,
+                              slave.registerCount);
+            // readHoldRegisters 内部调 enqueue()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 指数退避重连（未改动，与之前一致）
+// ═══════════════════════════════════════════════════════════════════════════
+
+void ModbusManager::scheduleReconnect()
+{
+    m_reconnectTimer->stop();
+    m_reconnectTimer->setInterval(m_reconnectDelayMs);
+    m_reconnectTimer->start();
+
+    qDebug() << QString("🟡 重连中... %1ms 后尝试重连")
+                    .arg(m_reconnectDelayMs);
+
+    m_reconnectDelayMs = qMin(m_reconnectDelayMs * 2,
+                              static_cast<int>(MaxReconnectDelayMs));
+}
+
+void ModbusManager::onReconnectTimer()
+{
+    if (m_modbusClient
+        && m_modbusClient->state() == QModbusDevice::ConnectedState) {
         return;
     }
 
-    if (reply->error() == QModbusDevice::NoError) {
-        const QModbusDataUnit unit = reply->result();
-        for (uint i = 0; i < unit.valueCount(); ++i) {
-            const int sensorId = unit.startAddress() + static_cast<int>(i);
-            const double value = static_cast<double>(unit.value(i));
+    qDebug() << "🟡 指数退避触发：尝试重连" << m_lastPortName << m_lastBaudRate;
 
-            qDebug() << QString("📡 Modbus 寄存器 [%1] → %2")
-                            .arg(sensorId)
-                            .arg(value);
-
-            // ★ 核心信号：数据跨线程投递到 DatabaseWorker
-            emit dataReceived(sensorId, value);
-        }
-    } else if (reply->error() != QModbusDevice::NoError) {
-        qDebug() << "⚠️ Modbus 读取错误:" << reply->errorString();
+    if (!m_modbusClient->connectDevice()) {
+        qDebug() << "❌ 重连失败:" << m_modbusClient->errorString();
+        scheduleReconnect();
     }
-
-    reply->deleteLater();
 }

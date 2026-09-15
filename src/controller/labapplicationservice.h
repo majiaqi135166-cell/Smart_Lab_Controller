@@ -55,6 +55,7 @@ public:
     // Modbus 实时数据（供 QML 绑定）
     QVariantMap modbusRegisters() const;
     bool modbusConnected() const { return m_modbusConnected; }
+    bool modbusReconnecting() const { return m_modbusReconnecting; }
 
 signals:
     void snapshotChanged(const DeviceSnapshot &snapshot);
@@ -71,6 +72,8 @@ signals:
     // Modbus 实时信号（驱动 QML 界面刷新）
     void modbusDataChanged(int sensorId, double value);
     void modbusConnectedChanged(bool connected);
+    void modbusReconnectingChanged(bool reconnecting);
+    void ModbussensorAlarm(QString msg);
 
 private slots:
     void handleDeviceLog();
@@ -80,9 +83,10 @@ private slots:
     void onTransportFrameReceived(const TransportFrame &frame);
 
     // Modbus 内部槽
-    void onModbusDataReceived(int sensorId, double value);
+    void onModbusDataReceived(int slaveId,int sensorId, double value);
     void onModbusConnected();
     void onModbusDisconnected();
+    void onModbusReconnecting();
 
 private:
     void logToDatabase(const QString &target, const QString &action, const QString &details);
@@ -99,11 +103,16 @@ private:
     DatabaseWorker *m_dbWorker;
     ModbusManager *m_modbusManager;
     bool m_modbusConnected = false;
+    bool m_modbusReconnecting = false;
     QMap<int, double> m_modbusRegisters;   // 寄存器地址 → 当前值
     QVariantList m_latestHistory;
     DeviceSnapshot m_snapshot;
     TcpDeviceChannel *m_transport;
     LabController *m_controller;
+    bool m_modbusiswarnig=false;
+    QTimer *m_alarmCooldown;
+    bool m_alarmArmed=false;
+
 };
 
 #endif

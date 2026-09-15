@@ -13,6 +13,7 @@ class ConfigManager : public QObject
     Q_PROPERTY(int serverPort READ serverPort WRITE setServerPort NOTIFY serverPortChanged)
     Q_PROPERTY(double threshold READ threshold WRITE setThreshold NOTIFY thresholdChanged)
     Q_PROPERTY(QString modbusPort READ modbusPort WRITE setModbusPort NOTIFY modbusPortChanged)
+    Q_PROPERTY(double tempThreshold READ tempThreshold WRITE setTempThreshold NOTIFY tempThresholdChanged)
 public:
     // 1. 获取单例的唯一静态接口
     static ConfigManager* instance() {
@@ -25,12 +26,14 @@ public:
     int serverPort() const { return m_serverPort; }
     double threshold() const { return m_threshold; }
     QString modbusPort() const { return m_modbusPort; }
+    double tempThreshold() const { return m_tempThreshold; }
 
     // 属性设置函数
     void setServerIp(const QString &ip);
     void setServerPort(int port);
     void setThreshold(double threshold);
     void setModbusPort(const QString &port);
+    void setTempThreshold(double threshold);
 
     // 保存和加载
     void saveConfig();
@@ -41,6 +44,7 @@ signals:
     void serverPortChanged();
     void thresholdChanged();
     void modbusPortChanged();
+    void tempThresholdChanged();
 
 private:
     // 2. 私有构造函数，防止外部实例化
@@ -55,6 +59,7 @@ private:
     QSettings *m_settings;
     double m_threshold;
     QString m_modbusPort;
+    double m_tempThreshold;
 };
 
 #endif // CONFIGMANAGER_H

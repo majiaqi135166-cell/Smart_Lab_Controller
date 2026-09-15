@@ -6,6 +6,7 @@ ConfigManager::ConfigManager(QObject *parent)
     , m_serverPort(8080)
     , m_threshold(200.0)
     , m_modbusPort(QStringLiteral("COM1"))
+    , m_tempThreshold(40.0)
 {
     m_settings = new QSettings("config.ini", QSettings::IniFormat, this);
     loadConfig();
@@ -17,8 +18,10 @@ void ConfigManager::loadConfig()
     m_serverPort = m_settings->value("Network/Port", 8080).toInt();
     m_threshold = m_settings->value("Safety/Threshold", 200.0).toDouble();
     m_modbusPort = m_settings->value("Modbus/Port", "COM1").toString();
+    m_tempThreshold = m_settings->value("Safety/TempThreshold", 40.0).toDouble();
     qDebug() << "Config Loaded: " << m_serverIp << ":" << m_serverPort
-             << "threshold:" << m_threshold << "modbusPort:" << m_modbusPort;
+             << "threshold:" << m_threshold << "modbusPort:" << m_modbusPort
+             << "tempThreshold:" << m_tempThreshold;
 }
 
 void ConfigManager::saveConfig()
@@ -26,6 +29,7 @@ void ConfigManager::saveConfig()
     m_settings->setValue("Network/IP", m_serverIp);
     m_settings->setValue("Network/Port", m_serverPort);
     m_settings->setValue("Safety/Threshold", m_threshold);
+    m_settings->setValue("Safety/TempThreshold", m_tempThreshold);
     m_settings->sync();
     qDebug() << "Config Saved!";
 }
@@ -62,6 +66,15 @@ void ConfigManager::setModbusPort(const QString &port)
     if (m_modbusPort != port) {
         m_modbusPort = port;
         emit modbusPortChanged();
+        saveConfig();
+    }
+}
+
+void ConfigManager::setTempThreshold(double threshold)
+{
+    if (!qFuzzyCompare(m_tempThreshold, threshold)) {
+        m_tempThreshold = threshold;
+        emit tempThresholdChanged();
         saveConfig();
     }
 }

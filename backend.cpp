@@ -24,6 +24,9 @@ backend::backend(QObject *parent)
             this, &backend::onModbusDataChanged);
     connect(m_service, &LabApplicationService::modbusConnectedChanged,
             this, &backend::onModbusConnectedChanged);
+    connect(m_service, &LabApplicationService::modbusReconnectingChanged,
+            this, &backend::onModbusReconnectingChanged);
+    connect(m_service,&LabApplicationService::ModbussensorAlarm,this,&backend::onModbusSensorAlarm);
 
     onSnapshotChanged(m_service->snapshot());
 }
@@ -156,6 +159,11 @@ bool backend::modbusConnected() const
     return m_service->modbusConnected();
 }
 
+bool backend::modbusReconnecting() const
+{
+    return m_service->modbusReconnecting();
+}
+
 QVariantMap backend::modbusRegisters() const
 {
     return m_service->modbusRegisters();
@@ -173,4 +181,15 @@ void backend::onModbusConnectedChanged(bool connected)
 {
     Q_UNUSED(connected)
     emit modbusConnectedChanged();
+}
+
+void backend::onModbusReconnectingChanged(bool reconnecting)
+{
+    Q_UNUSED(reconnecting)
+    emit modbusReconnectingChanged();
+}
+
+void backend::onModbusSensorAlarm(QString msg)
+{
+    emit ModbusALarm(msg);
 }

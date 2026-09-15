@@ -16,6 +16,7 @@ LabApplicationService::LabApplicationService(QObject *parent)
     , m_dbWorker(new DatabaseWorker())  // 同上
     , m_modbusManager(new ModbusManager())  // 主线程：Modbus 是异步的，不阻塞 UI
     , m_transport(new TcpDeviceChannel(this))
+    , m_alarmCooldown(new QTimer(this))
     , m_controller(new LabController([this](const QByteArray &payload) {
         m_transport->send(payload);
     }, this))
@@ -203,11 +204,28 @@ void LabApplicationService::setupModbus()
     connect(m_modbusManager, &ModbusManager::dataReceived,
             this, &LabApplicationService::onModbusDataReceived);
 
-    // ── 连接 3：ModbusManager 连接/断开状态 → UI ──
+    // ── 连接 3：ModbusManager 连接/断开/重连中 → UI ──
     connect(m_modbusManager, &ModbusManager::connected,
             this, &LabApplicationService::onModbusConnected);
     connect(m_modbusManager, &ModbusManager::disconnected,
             this, &LabApplicationService::onModbusDisconnected);
+    connect(m_modbusManager, &ModbusManager::reconnecting,
+            this, &LabApplicationService::onModbusReconnecting);
+    // 告警冷却定时器：30秒内不重复告警
+    m_alarmCooldown->setSingleShot(true);
+    connect(m_alarmCooldown, &QTimer::timeout, this, [this]()
+    {
+        m_alarmArmed = false;   // 冷却结束，重新武装告警
+    });
+
+
+    // ── 配置多从站 ──
+    // 从站 1：温湿度计，寄存器 0-1，每 2 秒轮询一次
+    m_modbusManager->addSlave(ModbusSlaveConfig(1, "温湿度计", 0, 2, 2000));
+    // 从站 2：风机控制器，寄存器 0，每 1 秒轮询一次
+    m_modbusManager->addSlave(ModbusSlaveConfig(2, "风机控制器", 0, 1, 1000));
+    // 从站 3：激光器，寄存器 2-3，每 3 秒轮询一次
+    m_modbusManager->addSlave(ModbusSlaveConfig(3, "激光器", 2, 2, 3000));
 
     // 从配置文件读取上次的串口号，自动连接
     const QString port = ConfigManager::instance()->modbusPort();
@@ -227,12 +245,14 @@ void LabApplicationService::connectModbus(const QString &portName, int baudRate)
     // 持久化配置，下次启动自动连接
     ConfigManager::instance()->setModbusPort(portName);
     m_modbusManager->connectToSlave(portName, baudRate);
+    // connectToSlave() 内部已将 m_autoReconnect 置为 true
 }
 
 void LabApplicationService::disconnectModbus()
 {
     qDebug() << "[LabAppService] 🔌 QML 发起断开连接";
     m_modbusManager->disconnectSlave();
+    // disconnectSlave() 内部已将 m_autoReconnect 置为 false，阻止重连
 }
 
 void LabApplicationService::writeModbusRegister(int slaveId, int addr, int value)
@@ -255,9 +275,57 @@ QVariantMap LabApplicationService::modbusRegisters() const
 
 // ── Modbus 内部槽 ──────────────────────────────────────────────────────────
 
-void LabApplicationService::onModbusDataReceived(int sensorId, double value)
+void LabApplicationService::onModbusDataReceived(int slaveId,int sensorId, double value)
 {
     m_modbusRegisters.insert(sensorId, value);
+
+    // ── 温度告警判断：从站1 寄存器0 = 温度 ──
+    const double tempThreshold = ConfigManager::instance()->tempThreshold();
+    const double recoveryThreshold = tempThreshold - 5.0;  // 迟滞：低于阈值5度才解除
+
+    // ① 触发条件：温度超过阈值，且不在30秒冷却期内
+    if (slaveId == 1 && sensorId == 0 && value > tempThreshold && !m_alarmArmed) {
+        // ── 硬件联动（两条路都要走）──
+        // 物理风机：Modbus 从站2 寄存器0 ← 1（真实硬件动作）
+        m_modbusManager->writeSingleRegister(2, 0, 1);
+        // 本地UI状态：同步 DeviceSnapshot，风扇图标转起来
+        m_controller->setFanActive(true);
+
+        // ── 告警通知（弹窗）──
+        emit ModbussensorAlarm(QString("⚠️ 温度过高: %1℃，已自动开启排风")
+                               .arg(value));
+
+        // ── 文件日志（LogWorker 写入本地文件）──
+        saveLog(QString("[CRITICAL] 温度超阈值 %1℃ > %2℃，排风已开启")
+                    .arg(value).arg(tempThreshold));
+
+        // ── 数据库记录（4个参数: level, target, action, details）──
+        emit dbLogRequested(QStringLiteral("CRITICAL"),
+                            QStringLiteral("sensor"),
+                            QStringLiteral("temp_alarm"),
+                            QString::number(value));
+
+        // ── 冷却：30秒内不再重复告警 ──
+        m_alarmArmed = true;
+        m_alarmCooldown->start(30000);
+        m_modbusiswarnig = true;
+    }
+
+    // ② 解除条件：温度低于恢复线（迟滞，防止40℃附近抖动）
+    if (m_modbusiswarnig && slaveId == 1 && sensorId == 0
+        && value < recoveryThreshold) {
+        // 物理风机：Modbus 从站2 寄存器0 ← 0
+        m_modbusManager->writeSingleRegister(2, 0, 0);
+        m_controller->setFanActive(false);
+        m_modbusiswarnig = false;
+
+        saveLog(QString("[INFO] 温度恢复正常 %1℃，排风已关闭").arg(value));
+        emit dbLogRequested(QStringLiteral("info"),
+                            QStringLiteral("sensor"),
+                            QStringLiteral("temp_normal"),
+                            QString::number(value));
+    }
+
     emit modbusDataChanged(sensorId, value);
     // 这条信号 → backend → QML property binding → UI 自动刷新
 }
@@ -265,13 +333,22 @@ void LabApplicationService::onModbusDataReceived(int sensorId, double value)
 void LabApplicationService::onModbusConnected()
 {
     m_modbusConnected = true;
+    m_modbusReconnecting = false;
     emit modbusConnectedChanged(true);
 }
 
 void LabApplicationService::onModbusDisconnected()
 {
     m_modbusConnected = false;
+    m_modbusReconnecting = false;
     emit modbusConnectedChanged(false);
+}
+
+void LabApplicationService::onModbusReconnecting()
+{
+    m_modbusConnected = false;
+    m_modbusReconnecting = true;
+    emit modbusReconnectingChanged(true);
 }
 
 void LabApplicationService::teardownThreads()

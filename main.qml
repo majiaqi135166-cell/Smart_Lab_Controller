@@ -38,6 +38,7 @@ Window {
             warnigPopup.open()
             backgroundFlashAnimation.start()
         }
+
         onHistoryFetched: {
             historyModel.clear()
             for (var i = 0; i < history.length; i++) {
@@ -48,9 +49,22 @@ Window {
         onLaserPowerChanged: addLog("激光功率已更新")
         onFanActiveChanged: addLog("风扇状态已更新")
         onIsOnlineChanged: addLog(cppbackend.isOnline ? "设备在线" : "设备离线")
-        onModbusConnectedChanged: addLog(cppbackend.modbusConnected ? "Modbus 已连接" : "Modbus 已断开")
+        onModbusConnectedChanged: {
+            if (cppbackend.modbusConnected) addLog("Modbus 已连接")
+        }
+        onModbusReconnectingChanged: {
+            if (cppbackend.modbusReconnecting) addLog("🟡 Modbus 重连中...")
+            else addLog("🔴 Modbus 已断开")
+        }
         onModbusRegistersChanged: {
-            // QML 绑定会自动更新，这里只做日志
+            // QML 绑定自动更新，无需手动处理
+        }
+        onModbusALarm: {
+            // 温度告警：红色弹窗 + 背景闪烁 + 日志
+            warnigPopup.popupText = msg
+            warnigPopup.open()
+            backgroundFlashAnimation.start()
+            addLog("🚨 " + msg)
         }
     }
 
@@ -270,6 +284,93 @@ Window {
                 }
             }
 
+            // ━━━━━━━━━━━━ 传感器趋势图（最近5分钟）━━━━━━━━━━━━━
+            Rectangle {
+                Layout.fillWidth: true
+                height: 350
+                color: "white"
+                radius: 10
+                border.color: "#dcdfe6"
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 10
+                    Text { text: "传感器趋势（最近5分钟）"; font.bold: true }
+
+                    ChartView {
+                        id: sensorTrendChart
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        antialiasing: true
+                        legend.visible: true            // 两条线需要图例区分
+                        legend.alignment: Qt.AlignBottom
+                        backgroundColor: "transparent"
+
+                        // X 轴：真实时间，格式"分:秒"
+                        DateTimeAxis {
+                            id: trendAxisX
+                            format: "mm:ss"
+                            min: new Date(Date.now() - 300000)  // 初始：5分钟前
+                            max: new Date()                     // 初始：现在
+                        }
+                        // Y 轴：温度湿度共用 0-100
+                        ValueAxis {
+                            id: trendAxisY
+                            min: 0
+                            max: 100
+                            titleText: "数值"
+                        }
+                        LineSeries {
+                            id: tempSeries
+                            name: "温度(℃)"
+                            color: "#E6A23C"
+                            width: 2
+                            axisX: trendAxisX        // ★ 必须绑定，否则自建坐标轴
+                            axisY: trendAxisY
+                        }
+                        LineSeries {
+                            id: humiSeries
+                            name: "湿度(%)"
+                            color: "#409EFF"
+                            width: 2
+                            axisX: trendAxisX
+                            axisY: trendAxisY
+                        }
+                    }
+                }
+
+                // 采样定时器：每 1 秒取一次数据
+                Timer {
+                    id: trendTimer
+                    interval: 1000
+                    running: true
+                    repeat: true
+                    onTriggered: {
+                        // ★ 断线时冻结图表：不再画旧值平线
+                        if (!cppbackend.modbusConnected) return
+
+                        var now = new Date().getTime()
+                        var temp = cppbackend.modbusRegisters["0"]
+                        var humi = cppbackend.modbusRegisters["1"]
+
+                        // ★ 数据可能未到达（undefined），跳过
+                        if (temp !== undefined)
+                            tempSeries.append(now, temp)
+                        if (humi !== undefined)
+                            humiSeries.append(now, humi)
+
+                        // 裁剪：只保留最近 5 分钟的点
+                        var cutoff = now - 300000
+                        while (tempSeries.count > 0 && tempSeries.at(0).x < cutoff)
+                            tempSeries.remove(0)
+                        while (humiSeries.count > 0 && humiSeries.at(0).x < cutoff)
+                            humiSeries.remove(0)
+
+                        // 滚动时间窗口：X 轴跟着时间走
+                        trendAxisX.min = new Date(now - 300000)
+                        trendAxisX.max = new Date(now)
+                    }
+                }
+            }
             // ━━━━━━━━━━━━ Modbus 传感器面板 ━━━━━━━━━━━━
             Rectangle {
                 Layout.fillWidth: true
@@ -282,17 +383,32 @@ Window {
                     anchors.margins: 10
                     spacing: 12
 
-                    // 标题行 + 连接指示灯
+                    // 标题行 + 三色状态指示灯
                     RowLayout {
                         Layout.fillWidth: true
                         Text { text: "Modbus 传感器监控"; font.bold: true; Layout.fillWidth: true }
+                        // 呼吸灯动画（重连中时闪烁）
                         Rectangle {
-                            width: 10; height: 10; radius: 5
-                            color: cppbackend.modbusConnected ? "#2ecc71" : "#e74c3c"
+                            id: statusDot
+                            width: 14; height: 14; radius: 7
                             anchors.verticalCenter: parent.verticalCenter
+                            property string state: cppbackend.modbusConnected ? "connected"
+                                                : (cppbackend.modbusReconnecting ? "reconnecting" : "disconnected")
+                            color: state === "connected" ? "#2ecc71"
+                                 : state === "reconnecting" ? "#e6a23c" : "#e74c3c"
+                            // 重连中：呼吸闪烁动画
+                            SequentialAnimation on opacity {
+                                running: statusDot.state === "reconnecting"
+                                loops: Animation.Infinite
+                                NumberAnimation { from: 1.0; to: 0.2; duration: 600 }
+                                NumberAnimation { from: 0.2; to: 1.0; duration: 600 }
+                            }
+                            // 非重连状态：完全不透明
+                            opacity: statusDot.state === "reconnecting" ? undefined : 1.0
                         }
                         Text {
-                            text: cppbackend.modbusConnected ? "已连接" : "未连接"
+                            text: statusDot.state === "connected" ? "🟢 已连接"
+                                : (statusDot.state === "reconnecting" ? "🟡 重连中..." : "🔴 已断开")
                             font.pixelSize: 12; color: "#909399"
                         }
                     }
@@ -415,3 +531,4 @@ Window {
         }
     }
 }
+

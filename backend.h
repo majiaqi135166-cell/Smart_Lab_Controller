@@ -18,6 +18,7 @@ class backend : public QObject
 
     // Modbus 属性（供 QML 绑定）
     Q_PROPERTY(bool modbusConnected READ modbusConnected NOTIFY modbusConnectedChanged)
+    Q_PROPERTY(bool modbusReconnecting READ modbusReconnecting NOTIFY modbusReconnectingChanged)
     Q_PROPERTY(QVariantMap modbusRegisters READ modbusRegisters NOTIFY modbusRegistersChanged)
 
 public:
@@ -48,6 +49,7 @@ public:
 
     // Modbus 属性读取
     bool modbusConnected() const;
+    bool modbusReconnecting() const;
     QVariantMap modbusRegisters() const;
 
 signals:
@@ -63,14 +65,17 @@ signals:
 
     // Modbus 信号（通知 QML）
     void modbusConnectedChanged();
+    void modbusReconnectingChanged();
     void modbusRegistersChanged();
+    void ModbusALarm(QString msg);
 
 private slots:
     void onSnapshotChanged(const DeviceSnapshot &snapshot);
     void onHistoryFetched(const QVariantList &history);
     void onModbusDataChanged(int sensorId, double value);
     void onModbusConnectedChanged(bool connected);
-
+    void onModbusReconnectingChanged(bool reconnecting);
+    void onModbusSensorAlarm(QString msg);
 private:
     LabApplicationService *m_service;
     DeviceSnapshot m_snapshot;
