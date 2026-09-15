@@ -82,7 +82,7 @@ bool ReceiveBuffer::append(const QByteArray &bytes) {
 
 ---
 
-#### C2. payloadLength 无条件信任 → 恶意超大声明
+#### C2. payloadLength 无条件信任 → 长度闸门 + 整数截断防御
 
 **修改前** (`src/protocol/protocoldeserializer.cpp`):
 ```cpp
@@ -93,23 +93,68 @@ if (!m_buffer.canPeek(packetSize)) {
 }
 ```
 
-**修改后**:
+**第一版修复**（加长度闸门，256KB 上限）:
 ```cpp
 // 先校验 payloadLength 上限（256KB），超限则跳过并告警
 if (header.payloadLength > PacketHeader::MaxPayloadSize) {
     emit errorOccurred(QStringLiteral("Oversized payload declared (%1 bytes) — packet discarded")
                            .arg(header.payloadLength));
-    // 跳过这个包（丢弃 header + 声明长度的数据）
     m_buffer.consume(PacketHeader::EncodedSize);
     m_buffer.consume(m_buffer.size());
     continue;
 }
 ```
 
-**面试说法**:
-> "二进制协议中，payloadLength 字段来自网络对端，属于不可信输入。如果攻击者发送一个 payloadLength=2GB 的包，直接用这个值去 canPeek() 会导致巨大的内存分配或死循环。我加了 256KB 的 MaxPayloadSize 上限校验，超过就丢弃整个包并上报错误。这和 HTTP 服务器的 max_request_body_size 是同一个道理。"
+**⚠️ 第一版修复自身引入的死循环**（review 时发现，已修复）:
 
-**知识点**: 不可信输入校验、协议安全、防御性编程
+`header.payloadLength` 是 `quint32`，`static_cast<int>` 在超过 `INT_MAX` 时按补码回绕成负数：
+
+```
+payloadLength = 0xFFFFFFF6  (= 4294967286)
+  → (int)0xFFFFFFF6 = -10
+  → skipSize = 10 + (-10) = 0
+  → canPeek(0) 恒为 true   ← "至少 0 字节"是空真命题，永远成立
+  → consume(0) 直接 return ← `if (size <= 0) return;` 是空操作
+  → 缓冲一个字节没动 → continue → 状态完全不变 → 无限循环 💥
+```
+
+十个字节 `AB CD 01 xx FF FF FF F6 xx xx` 就能让**主线程永久卡死**（解析跑在 `onReadyRead` 里），同时每轮 `emit errorOccurred` 造成日志刷屏。
+
+**最终修复**（qint64 提升 + 保证每次迭代有进展）:
+```cpp
+if (header.payloadLength > PacketHeader::MaxPayloadSize) {
+    // 用 qint64 计算：quint32 → int 会截断成负数，导致 skipSize ≤ 0 → 循环无法推进
+    const qint64 declaredTotal = static_cast<qint64>(PacketHeader::EncodedSize)
+                               + static_cast<qint64>(header.payloadLength);
+    if (declaredTotal <= m_buffer.size()) {
+        m_buffer.consume(static_cast<int>(declaredTotal));   // 整包已到齐：精确丢弃
+    } else {
+        m_buffer.consume(PacketHeader::EncodedSize);
+        m_buffer.consume(m_buffer.size());   // 声明长度 > 缓冲上限，这帧永远收不全
+    }
+    emit errorOccurred(...);
+    continue;
+}
+```
+
+顺带一提：这一改还让下游第 43 行的 `static_cast<int>(header.payloadLength)` **变安全了**——能走到那里说明 `payloadLength ≤ 262144`，转换必然无损。防御性检查应该有"保护下游"的效果。
+
+**边界值测试表**（手写用例，可复现）:
+
+| payloadLength 输入 | 期望行为 | 第一版 |
+|---|---|---|
+| `0` | 正常解析 | ✅ |
+| `MaxPayloadSize` (262144) | 正常解析 | ✅ |
+| `MaxPayloadSize + 1` | 丢弃并上报 | ✅ |
+| `0x7FFFFFFF` | 丢弃并上报 | ✅ |
+| `0x80000000` | 丢弃并上报 | ⚠️ `10 + INT_MIN` 有符号溢出 UB |
+| **`0xFFFFFFF6`** | 丢弃并上报 | 💥 **永久卡死** |
+| `0xFFFFFFFF` | 丢弃并上报 | ⚠️ 只吃掉 9 字节 |
+
+**面试说法**:
+> "二进制协议中 payloadLength 是对端给的不可信输入，我用 256KB 上限拦截超大声明——这和 HTTP 的 max_request_body_size 是同一个思路。但更有意思的是，我这个修复的第一版**本身是错的**：它做 `static_cast<int>`，当 payloadLength = 0xFFFFFFF6 时会截断成 -10，算出跳过长度为 0；而 `canPeek(0)` 恒真、`consume(0)` 是空操作，两者组合成'检查通过但动作无效'——一个十字节的包就能让主线程永久卡死。这让我总结出一条不变式：**解析循环每一轮必须消费至少 1 字节，或者退出**。我用同一条不变式在同一个文件里又找出了第二处同类死循环。"
+
+**知识点**: 不可信输入校验、整数截断与符号、循环不变式、边界值测试
 
 ---
 
@@ -417,24 +462,70 @@ void ConfigManager::setThreshold(double threshold) {
 
 ---
 
-#### H7. 损坏前缀扫描 O(n²) → 优化线性扫描
+#### H7. 损坏前缀扫描 `consume(0)` → 第二处死循环（与 C2 同一根因）
 
 **修改前**:
 ```cpp
-// 逐字节扫描直到找到 magic number 0xABCD
-// 每次只跳过 1 字节，最坏情况 O(n²)
-for (int i = 1; i < available.size(); ++i) {
-    if (available.at(i-1) == magicHigh && available.at(i) == magicLow) {
-        m_buffer.consume(i - 1);
-        return true;
+bool ProtocolDeserializer::tryConsumeCorruptedPrefix()
+{
+    if (!m_buffer.canPeek(2)) {
+        return false;
     }
+
+    const QByteArray available = m_buffer.peek(m_buffer.size());
+    // 逐字节扫描直到找到 magic number 0xABCD
+    for (int i = 1; i < available.size(); ++i) {   // ← 从 i=1 开始，位置 0 也会被比较
+        if (available.at(i-1) == 0xAB && available.at(i) == 0xCD) {
+            m_buffer.consume(i - 1);   // i=1 时 → consume(0)：一个字节没动
+            return true;
+        }
+    }
+    m_buffer.consume(qMax(0, available.size() - 1));
+    return m_buffer.canPeek(2);
 }
-m_buffer.consume(qMax(0, available.size() - 1));
 ```
 
-**修改后**: 逻辑相同但清理了死代码，扫描效率在数据量不大时持平。对于大规模损坏数据的优化方案（如 `QByteArray::indexOf`）在高频调用场景下更有优势。
+**死循环场景**——合法帧被 TCP 拆包、魔数恰好落在缓冲开头：
 
-**知识点**: 协议帧同步、魔数检测、流式解析
+```
+buffer = [AB CD 01]         ← 合法帧头的前 3 字节，还没收齐
+tryReadHeader: canPeek(10) 失败 → false    ← 注意：这条路径没检查过任何字节！
+tryConsumeCorruptedPrefix: i=1 命中 (0,1)=(AB,CD) → consume(0) → return true
+→ continue → 状态完全没变 → 💥 无限循环
+```
+
+**根因是语义错配**：`tryReadHeader` 返回 false 有**三种**含义——① 数据不足（拿不准）② 魔数错 ③ 版本错。而这个函数默认"被调用 = 缓冲开头一定是垃圾"，该假设只对 ②③ 成立，对 ① 有害。更讽刺的是：它是在**自己正确工作之后**被自己钉死的——它先把游标对齐到了合法魔数 `AB CD`，下一次调用就命中了位置 0。
+
+**最终修复**:
+```cpp
+bool ProtocolDeserializer::tryConsumeCorruptedPrefix()
+{
+    // ① 帧头没收齐 → 拿不准，一个字节都别动（拆包 ≠ 损坏）
+    if (!m_buffer.canPeek(PacketHeader::EncodedSize)) {
+        return false;
+    }
+
+    const QByteArray available = m_buffer.peek(m_buffer.size());
+    ...
+    // ② 从 i=2 开始：位置 0 已被 tryReadHeader 判过死刑，不许再对齐回去
+    for (int i = 2; i < available.size(); ++i) { ... }
+
+    m_buffer.consume(qMax(0, available.size() - 1));
+    return false;   // 只剩 1 字节，等下次 readyRead
+}
+```
+
+| 修复 | 治什么 | 不修会怎样 |
+|---|---|---|
+| `canPeek(EncodedSize)` 守卫 | 拆包被误判为损坏 | 死循环 + 吃掉合法半帧 |
+| 起点改 `i = 2` | 版本错时对齐回假头 | 死循环（守卫挡不住，此时位置 0 的 `AB CD` 真实存在） |
+
+代价是垃圾清理会延迟到帧头收齐之后——**宁可晚清，不可错清：信息不足时做任何丢弃都是拿数据赌博**。
+
+**面试说法**:
+> "这是我在同一个解析器里找到的第二处死循环，和 C2 的整数截断是同一个根因——**循环迭代没有推进**。有意思的是这次是两个各自正确的防御组合出来的：`canPeek` 里的 `size >= 0` 防负数、`consume` 里的 `if (size <= 0) return` 防误用，单独看都没问题，组合起来就是'检查通过、动作无效'。我现在的习惯是写完解析循环，逐条 `continue` 分支问一句：**这一轮我推进了吗？**"
+
+**知识点**: 协议帧同步、魔数检测、流式解析、循环不变式、拆包与损坏的语义区分
 
 ---
 
@@ -544,6 +635,8 @@ m_buffer.consume(qMax(0, available.size() - 1));
 | **资源限制** | 发送队列最多 256 条、重连最多 30s 间隔 |
 | **浮点安全** | `qFuzzyCompare` 替代 `==`、功率阈值可配置 |
 | **生命周期安全** | 析构顺序：停 I/O → 断开连接 → 停线程 → 删除对象 |
+| **解析循环不变式** | 每轮迭代必须消费 ≥1 字节或退出，杜绝死循环（2 处已修） |
+| **整数宽度安全** | 网络字段（quint32）算术前提升到 `qint64`，防截断/溢出 |
 
 ---
 
