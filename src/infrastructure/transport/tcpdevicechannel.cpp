@@ -24,15 +24,18 @@ TcpDeviceChannel::TcpDeviceChannel(QObject *parent)
     connect(&m_heartbeatTimer, &QTimer::timeout, this, &TcpDeviceChannel::onHeartbeatTimeout);
     connect(&m_handshakeRetryTimer, &QTimer::timeout, this, &TcpDeviceChannel::onHandshakeRetryTimeout);
     connect(&m_reconnectTimer, &QTimer::timeout, this, &TcpDeviceChannel::onReconnectTimer);
-
+    connect(&m_socket,QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::error),this,&TcpDeviceChannel::onSocketError);
     // Forward deserializer errors
     connect(&m_deserializer, &ProtocolDeserializer::errorOccurred,
             this, &ITransportChannel::errorOccurred);
 }
 
+
+
 void TcpDeviceChannel::start()
 {
     updateState(ConnectionState::LoadingConfig, false);
+    m_autoReconnect=true;
     m_handshakeComplete = false;
     m_handshakeRetries = 0;
     m_reconnectDelayMs = MinReconnectDelayMs;
@@ -47,12 +50,13 @@ void TcpDeviceChannel::start()
 
 void TcpDeviceChannel::stop()
 {
+    m_autoReconnect=false;
     m_reconnectTimer.stop();
     m_heartbeatTimer.stop();
     m_handshakeRetryTimer.stop();
     m_handshakeComplete = false;
     m_sendQueue.clear();
-    m_socket.abort();  // abort: immediately close, no wait
+    m_socket.disconnectFromHost();  // abort: immediately close, no wait
     updateState(ConnectionState::Idle, false);
 }
 
@@ -85,6 +89,15 @@ TransportStatus TcpDeviceChannel::status() const
 }
 
 // ─── Slots ──────────────────────────────────────────────────────────────────
+void TcpDeviceChannel::onSocketError(QAbstractSocket::SocketError error)
+{
+    Q_UNUSED(error);
+    if(m_socket.state()==QAbstractSocket::UnconnectedState)
+    {
+        updateState(ConnectionState::Recovering,false);
+        scheduleReconnect();
+    }
+}
 
 void TcpDeviceChannel::onConnected()
 {
@@ -248,12 +261,13 @@ bool TcpDeviceChannel::doWrite(const QByteArray &data)
         // If after flush there's still data buffered internally, QTcpSocket handles it.
         // We still count this as "sent" since the OS/kernel takes over.
     }
-    return true;
+    return true; // true = 已交给 Qt 的发送缓冲；false = 已入离线队列
 }
 
 void TcpDeviceChannel::scheduleReconnect()
 {
-    m_reconnectTimer.stop();
+    if(!m_autoReconnect) return;
+    if(m_reconnectTimer.isActive())return;
     m_reconnectTimer.setInterval(m_reconnectDelayMs);
     m_reconnectTimer.start();
 

@@ -38,6 +38,7 @@ public:
 signals:
     void sendQueueDropped(int count);
 
+
 private slots:
     void onConnected();
     void onDisconnected();
@@ -45,6 +46,7 @@ private slots:
     void onHeartbeatTimeout();
     void onHandshakeRetryTimeout();
     void onReconnectTimer();
+    void onSocketError(QAbstractSocket::SocketError error);
 
 private:
     void updateState(ConnectionState state, bool online);
@@ -67,6 +69,7 @@ private:
     bool m_handshakeComplete = false;
     int m_handshakeRetries = 0;
     int m_reconnectDelayMs = MinReconnectDelayMs;
+    bool m_autoReconnect=true;
 };
 
 #endif
