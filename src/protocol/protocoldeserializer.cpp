@@ -76,9 +76,6 @@ bool ProtocolDeserializer::tryReadHeader(PacketHeader &header) const
 
 bool ProtocolDeserializer::tryConsumeCorruptedPrefix()
 {
-    if (!m_buffer.canPeek(2)) {
-        return false;
-    }
 
     if (!m_buffer.canPeek(PacketHeader::EncodedSize))
              return false;

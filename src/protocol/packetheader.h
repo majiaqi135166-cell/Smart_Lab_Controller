@@ -9,7 +9,6 @@ struct PacketHeader
     enum : quint8  { Version = 1 };
     enum : int     { EncodedSize = 10 };             // 2(magic)+1(ver)+1(type)+4(len)+2(crc) = 10
     enum : quint32 { MaxPayloadSize = 262144 };      // 256 KB
-    enum : int     { MaxTotalPacketSize = EncodedSize + MaxPayloadSize };
 
     quint16 magic = Magic;
     quint8 version = Version;
